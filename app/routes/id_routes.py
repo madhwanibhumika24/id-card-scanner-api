@@ -7,6 +7,7 @@ import numpy as np
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
 from app.services.image_processing import preprocess_image
+from app.services.face_extraction import extract_face_thumbnail
 
 router = APIRouter()
 
@@ -23,7 +24,10 @@ MAX_FILE_SIZE = 10 * 1024 * 1024
 @router.post("/process-id")
 async def process_id(file: UploadFile = File(...)):
     if not file.filename:
-        raise HTTPException(status_code=400, detail="Filename is required")
+        raise HTTPException(
+            status_code=400,
+            detail="Filename is required",
+        )
 
     extension = Path(file.filename).suffix.lower()
 
@@ -36,10 +40,16 @@ async def process_id(file: UploadFile = File(...)):
     contents = await file.read(MAX_FILE_SIZE + 1)
 
     if not contents:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty",
+        )
 
     if len(contents) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="Maximum file size is 10 MB")
+        raise HTTPException(
+            status_code=413,
+            detail="Maximum file size is 10 MB",
+        )
 
     image_array = np.frombuffer(contents, dtype=np.uint8)
     image = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
@@ -59,19 +69,50 @@ async def process_id(file: UploadFile = File(...)):
         )
 
     image_id = str(uuid4())
+
     upload_path = UPLOAD_DIR / f"{image_id}{extension}"
     processed_path = PROCESSED_DIR / f"{image_id}.jpg"
+    ocr_image_path = PROCESSED_DIR / f"{image_id}_ocr.png"
 
     if not cv2.imwrite(str(upload_path), image):
-        raise HTTPException(status_code=500, detail="Could not save upload")
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save uploaded image",
+        )
 
     try:
-        result = preprocess_image(image, processed_path)
-    except (ValueError, RuntimeError, cv2.error) as exc:
+        # Step 1: Detect, crop, and preprocess the card.
+        preprocessing = preprocess_image(image, processed_path)
+
+        # Step 2: Detect and save a face thumbnail.
+        face_result = extract_face_thumbnail(image, image_id)
+
+        # Step 3: OCR is temporarily disabled.
+        # We will enable it after the EasyOCR model downloads.
+        ocr_result = {
+            "full_text": "",
+            "lines": [],
+        }
+
+        extracted_fields = {
+            "full_name": None,
+            "document_number": None,
+            "date_of_birth": None,
+            "expiry_date": None,
+        }
+
+    except Exception as exc:
+        # Remove generated files if processing fails.
         upload_path.unlink(missing_ok=True)
+        processed_path.unlink(missing_ok=True)
+        ocr_image_path.unlink(missing_ok=True)
+
+        face_path = FACE_DIR_PATH(image_id)
+        face_path.unlink(missing_ok=True)
+
         raise HTTPException(
             status_code=422,
-            detail=f"Image preprocessing failed: {exc}",
+            detail=f"Image processing failed: {exc}",
         ) from exc
 
     return {
@@ -83,12 +124,14 @@ async def process_id(file: UploadFile = File(...)):
             "format": extension.lstrip("."),
             "size_bytes": len(contents),
         },
-        "preprocessing": result,
-        "extracted_fields": {
-            "full_name": None,
-            "document_number": None,
-            "date_of_birth": None,
-            "expiry_date": None,
-        },
+        "preprocessing": preprocessing,
+        "face_extraction": face_result,
+        "extracted_fields": extracted_fields,
+        "ocr": ocr_result,
         "processing_status": "preprocessed",
     }
+
+
+def FACE_DIR_PATH(image_id: str) -> Path:
+    """Return the face-thumbnail path for cleanup."""
+    return Path("faces") / f"{image_id}_face.jpg"
