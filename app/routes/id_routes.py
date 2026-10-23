@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from fastapi import APIRouter, File, HTTPException, UploadFile
 
+from app.database.models import save_record, get_record_by_id
 from app.services.image_processing import preprocess_image
 from app.services.face_extraction import extract_face_thumbnail
 
@@ -13,9 +14,10 @@ router = APIRouter()
 
 UPLOAD_DIR = Path("uploads")
 PROCESSED_DIR = Path("processed")
+FACE_DIR = Path("faces")
 
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+for directory in (UPLOAD_DIR, PROCESSED_DIR, FACE_DIR):
+    directory.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -69,10 +71,12 @@ async def process_id(file: UploadFile = File(...)):
         )
 
     image_id = str(uuid4())
+    safe_filename = f"{image_id}{extension}"
 
-    upload_path = UPLOAD_DIR / f"{image_id}{extension}"
+    upload_path = UPLOAD_DIR / safe_filename
     processed_path = PROCESSED_DIR / f"{image_id}.jpg"
     ocr_image_path = PROCESSED_DIR / f"{image_id}_ocr.png"
+    face_path = FACE_DIR / f"{image_id}_face.jpg"
 
     if not cv2.imwrite(str(upload_path), image):
         raise HTTPException(
@@ -81,14 +85,10 @@ async def process_id(file: UploadFile = File(...)):
         )
 
     try:
-        # Step 1: Detect, crop, and preprocess the card.
         preprocessing = preprocess_image(image, processed_path)
-
-        # Step 2: Detect and save a face thumbnail.
         face_result = extract_face_thumbnail(image, image_id)
 
-        # Step 3: OCR is temporarily disabled.
-        # We will enable it after the EasyOCR model downloads.
+        # OCR is temporarily disabled until the model download is fixed.
         ocr_result = {
             "full_text": "",
             "lines": [],
@@ -101,37 +101,50 @@ async def process_id(file: UploadFile = File(...)):
             "expiry_date": None,
         }
 
+        record = {
+            "id": image_id,
+            "filename": safe_filename,
+            "metadata": {
+                "original_width": width,
+                "original_height": height,
+                "format": extension.lstrip("."),
+                "size_bytes": len(contents),
+            },
+            "preprocessing": preprocessing,
+            "face_extraction": face_result,
+            "extracted_fields": extracted_fields,
+            "ocr": ocr_result,
+            "processing_status": "preprocessed",
+        }
+
+        save_record(record)
+
     except Exception as exc:
-        # Remove generated files if processing fails.
         upload_path.unlink(missing_ok=True)
         processed_path.unlink(missing_ok=True)
         ocr_image_path.unlink(missing_ok=True)
-
-        face_path = FACE_DIR_PATH(image_id)
         face_path.unlink(missing_ok=True)
 
         raise HTTPException(
-            status_code=422,
-            detail=f"Image processing failed: {exc}",
+            status_code=500,
+            detail=f"Image processing or database save failed: {exc}",
         ) from exc
 
     return {
-        "id": image_id,
-        "message": "Image uploaded and preprocessed successfully",
-        "metadata": {
-            "original_width": width,
-            "original_height": height,
-            "format": extension.lstrip("."),
-            "size_bytes": len(contents),
-        },
-        "preprocessing": preprocessing,
-        "face_extraction": face_result,
-        "extracted_fields": extracted_fields,
-        "ocr": ocr_result,
-        "processing_status": "preprocessed",
+        **record,
+        "message": "Image processed and record saved successfully",
     }
 
 
-def FACE_DIR_PATH(image_id: str) -> Path:
-    """Return the face-thumbnail path for cleanup."""
-    return Path("faces") / f"{image_id}_face.jpg"
+@router.get("/records/{record_id}")
+def get_record(record_id: str):
+    """Retrieve a previously processed record from SQLite."""
+    record = get_record_by_id(record_id)
+
+    if record is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Record not found",
+        )
+
+    return record
