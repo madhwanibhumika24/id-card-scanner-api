@@ -9,6 +9,9 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from app.database.models import save_record, get_record_by_id
 from app.services.image_processing import preprocess_image
 from app.services.face_extraction import extract_face_thumbnail
+from app.services.ocr_service import extract_text
+from app.utils.field_extraction import extract_fields
+
 
 router = APIRouter()
 
@@ -28,7 +31,7 @@ async def process_id(file: UploadFile = File(...)):
     if not file.filename:
         raise HTTPException(
             status_code=400,
-            detail="Filename is required",
+            detail="No filename provided.",
         )
 
     extension = Path(file.filename).suffix.lower()
@@ -36,7 +39,7 @@ async def process_id(file: UploadFile = File(...)):
     if extension not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail="Only JPG, JPEG, and PNG images are allowed",
+            detail="Only JPG, JPEG, and PNG images are supported.",
         )
 
     contents = await file.read(MAX_FILE_SIZE + 1)
@@ -44,13 +47,13 @@ async def process_id(file: UploadFile = File(...)):
     if not contents:
         raise HTTPException(
             status_code=400,
-            detail="Uploaded file is empty",
+            detail="Uploaded file is empty.",
         )
 
     if len(contents) > MAX_FILE_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="Maximum file size is 10 MB",
+            detail="File exceeds the 10 MB size limit.",
         )
 
     image_array = np.frombuffer(contents, dtype=np.uint8)
@@ -59,7 +62,7 @@ async def process_id(file: UploadFile = File(...)):
     if image is None:
         raise HTTPException(
             status_code=400,
-            detail="Uploaded file is not a readable image",
+            detail="Uploaded file is not a valid image.",
         )
 
     height, width = image.shape[:2]
@@ -67,7 +70,7 @@ async def process_id(file: UploadFile = File(...)):
     if width < 100 or height < 100:
         raise HTTPException(
             status_code=400,
-            detail="Image must be at least 100 x 100 pixels",
+            detail="Image dimensions must be at least 100 x 100 pixels.",
         )
 
     image_id = str(uuid4())
@@ -81,26 +84,25 @@ async def process_id(file: UploadFile = File(...)):
     if not cv2.imwrite(str(upload_path), image):
         raise HTTPException(
             status_code=500,
-            detail="Could not save uploaded image",
+            detail="Failed to save uploaded image.",
         )
 
     try:
+        # 1. Detect card boundary and preprocess the image.
         preprocessing = preprocess_image(image, processed_path)
+
+        # 2. Detect and save a face thumbnail when possible.
         face_result = extract_face_thumbnail(image, image_id)
 
-        # OCR is temporarily disabled until the model download is fixed.
-        ocr_result = {
-            "full_text": "",
-            "lines": [],
-        }
+        # 3. Run OCR on the generated OCR-ready image.
+        ocr_result = extract_text(str(ocr_image_path))
 
-        extracted_fields = {
-            "full_name": None,
-            "document_number": None,
-            "date_of_birth": None,
-            "expiry_date": None,
-        }
+        # 4. Convert recognized text into structured fields.
+        extracted_fields = extract_fields(
+            ocr_result.get("full_text", "")
+        )
 
+        # 5. Prepare the record for SQLite.
         record = {
             "id": image_id,
             "filename": safe_filename,
@@ -120,31 +122,34 @@ async def process_id(file: UploadFile = File(...)):
         save_record(record)
 
     except Exception as exc:
-        upload_path.unlink(missing_ok=True)
-        processed_path.unlink(missing_ok=True)
-        ocr_image_path.unlink(missing_ok=True)
-        face_path.unlink(missing_ok=True)
+        # Remove generated files if processing or saving fails.
+        for path in (
+            upload_path,
+            processed_path,
+            ocr_image_path,
+            face_path,
+        ):
+            path.unlink(missing_ok=True)
 
         raise HTTPException(
             status_code=500,
-            detail=f"Image processing or database save failed: {exc}",
+            detail="Image processing failed. Check the server logs.",
         ) from exc
 
     return {
         **record,
-        "message": "Image processed and record saved successfully",
+        "message": "Image processed and record saved successfully.",
     }
 
 
 @router.get("/records/{record_id}")
 def get_record(record_id: str):
-    """Retrieve a previously processed record from SQLite."""
     record = get_record_by_id(record_id)
 
     if record is None:
         raise HTTPException(
             status_code=404,
-            detail="Record not found",
+            detail="Record not found.",
         )
 
     return record
